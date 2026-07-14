@@ -34,6 +34,7 @@ def _c(code: str, text: str, stream=sys.stdout) -> str:
 
 HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
 MODEL = os.environ.get("POLICY_MODEL", "qwen2.5:3b")
+EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 NUM_CTX = 8192
 MAX_ITERS = 6
 TIMEOUT = 180
@@ -146,9 +147,27 @@ TOOLS = [
 # --------------------------------------------------------------------------- #
 # Tool dispatch (backed by retrieval.py)
 # --------------------------------------------------------------------------- #
+def _embed_query(text: str) -> "list[float] | None":
+    """Embed a query for hybrid search; return None on any failure (BM25-only)."""
+    try:
+        payload = json.dumps(
+            {"model": EMBED_MODEL, "input": ["search_query: " + text]}
+        ).encode()
+        req = urllib.request.Request(
+            f"{HOST}/api/embed", data=payload, headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read())["embeddings"][0]
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _tool_search_docs(args: dict) -> str:
     r = get_retriever()
-    hits = r.search(str(args.get("keyword", "")), int(args.get("limit", 6) or 6))
+    kw = str(args.get("keyword", ""))
+    k = int(args.get("limit", 6) or 6)
+    qvec = _embed_query(kw) if r.has_embeddings else None
+    hits = r.search_hybrid(kw, qvec, k)
     if not hits:
         return (
             f'No sections matched "{args.get("keyword", "")}". Try different terms, '

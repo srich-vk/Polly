@@ -23,12 +23,19 @@ codes):
    answer isn't in the docs, it says so instead of guessing. A **citation
    verifier** flags any cited clause that doesn't actually exist in the index.
 
+The agent's `search_docs` is **hybrid**: BM25 (exact terms) interleaved with
+semantic search (`nomic-embed-text` embeddings) so paraphrased / conceptual
+queries — where you don't know the doc's wording — still find the right section.
+`--search` stays pure BM25 (instant, no model). Hybrid activates only when
+`embeddings.json` is present, else it degrades to BM25.
+
 ## Prerequisites
 
 - Python 3 (stdlib only)
 - [ollama] running locally with the model pulled:
   ```bash
-  ollama pull qwen2.5:3b        # ~1.9 GB, sized for a 4 GB GPU
+  ollama pull qwen2.5:3b        # ~1.9 GB generation model, sized for a 4 GB GPU
+  ollama pull nomic-embed-text  # ~274 MB, for hybrid semantic search (optional)
   ```
 - To *rebuild* the index only: `poppler` (`pdftotext`, `pdftoppm`), `tesseract`
   OCR, and `pdfplumber` (`pip install --user pdfplumber`, for structured parsing
@@ -66,15 +73,18 @@ Run whenever the PDFs in `College Guidelines/` change:
 
 ```bash
 python3 build_index.py --docs "College Guidelines" --out index.json
+python3 build_embeddings.py     # regenerate semantic index (needs nomic-embed-text)
 ```
 
 ## Files
 
 | File | Role |
 |---|---|
-| `build_index.py` | PDF → clause-chunked `index.json` (with OCR fallback) |
-| `index.json` | Generated index — 63 docs, 631 chunks |
-| `retrieval.py` | Stdlib BM25 retrieval engine |
+| `build_index.py` | PDF → clause-chunked `index.json` (OCR + table parsing + size cap) |
+| `build_embeddings.py` | `index.json` → `embeddings.json` (semantic vectors, optional) |
+| `index.json` | Generated lexical index — 63 docs, ~1000 chunks |
+| `embeddings.json` | Generated semantic index (one vector per chunk) |
+| `retrieval.py` | Stdlib BM25 + hybrid (BM25 ⋈ semantic) retrieval engine |
 | `policy_ask.py` | Agent loop + tool dispatch + citation verifier + CLI |
 
 ## Curriculum / course-list queries

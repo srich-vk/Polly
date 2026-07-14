@@ -65,16 +65,31 @@ class Retriever:
                 self._df[t] = self._df.get(t, 0) + 1
         self._avgdl = total_len / self._N if self._N else 0.0
 
+        # Optional semantic index (embeddings.json). Absent -> pure BM25.
+        self._emb: list[Optional[list[float]]] = [None] * self._N
+        self._emb_norm: list[float] = [0.0] * self._N
+        self.has_embeddings = False
+        epath = INDEX_PATH.with_name("embeddings.json")
+        if epath.exists():
+            try:
+                by_id = json.loads(epath.read_text(encoding="utf-8")).get("by_id", {})
+                for i, c in enumerate(self.chunks):
+                    v = by_id.get(c["id"])
+                    if v:
+                        self._emb[i] = v
+                        self._emb_norm[i] = math.sqrt(sum(x * x for x in v))
+                self.has_embeddings = any(v is not None for v in self._emb)
+            except (ValueError, OSError):
+                pass
+
     def _idf(self, term: str) -> float:
         n = self._df.get(term, 0)
         # BM25 idf floored at 0 so common terms can't push scores negative.
         return max(0.0, math.log(1 + (self._N - n + 0.5) / (n + 0.5)))
 
-    def search(self, query: str, k: int = 6) -> list[dict]:
-        qset = list(dict.fromkeys(tokenize(expand_query(query))))
-        if not qset:
-            return []
-        scored: list[tuple[float, int]] = []
+    def _bm25_ranked(self, qset: list[str]) -> list[tuple[int, float]]:
+        """All chunks with score > 0, sorted best-first: [(chunk_index, score)]."""
+        scored: list[tuple[int, float]] = []
         for i, toks in enumerate(self._doc_tokens):
             length = len(toks)
             if not length:
@@ -90,20 +105,67 @@ class Retriever:
                 denom = f + _K1 * (1 - _B + _B * length / self._avgdl)
                 score += self._idf(term) * (f * (_K1 + 1) / denom)
             if score > 0:
-                scored.append((score, i))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        hits = []
-        for score, i in scored[:k]:
-            c = self.chunks[i]
-            hits.append({
-                "id": c["id"],
-                "doc": c["doc"],
-                "clause": c["clause"],
-                "page": c["page"],
-                "score": round(score, 3),
-                "snippet": _snippet(c["text"], qset),
-            })
-        return hits
+                scored.append((i, score))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored
+
+    def _semantic_ranked(self, qvec: list[float]) -> list[tuple[int, float]]:
+        """Chunks ranked by cosine similarity to the query vector."""
+        qn = math.sqrt(sum(x * x for x in qvec)) or 1.0
+        out: list[tuple[int, float]] = []
+        for i, vec in enumerate(self._emb):
+            if vec is None:
+                continue
+            dot = sum(a * b for a, b in zip(qvec, vec))
+            out.append((i, dot / (qn * self._emb_norm[i]) if self._emb_norm[i] else 0.0))
+        out.sort(key=lambda x: x[1], reverse=True)
+        return out
+
+    def _hit(self, i: int, score: float, qset: list[str]) -> dict:
+        c = self.chunks[i]
+        return {
+            "id": c["id"], "doc": c["doc"], "clause": c["clause"], "page": c["page"],
+            "score": round(score, 4), "snippet": _snippet(c["text"], qset),
+        }
+
+    def search(self, query: str, k: int = 6) -> list[dict]:
+        """Pure lexical BM25 search (used by the offline --search path)."""
+        qset = list(dict.fromkeys(tokenize(expand_query(query))))
+        if not qset:
+            return []
+        return [self._hit(i, s, qset) for i, s in self._bm25_ranked(qset)[:k]]
+
+    def search_hybrid(self, query: str, qvec: Optional[list[float]],
+                      k: int = 6) -> list[dict]:
+        """Interleave BM25 and semantic top hits (BM25 first).
+
+        Round-robin merge guarantees the strongest lexical hit (exact terms) and
+        the strongest semantic hit (paraphrase/concept) both appear near the top,
+        instead of a fused ranking where one signal dilutes the other. Falls back
+        to pure BM25 when no query vector / no embeddings are present.
+        """
+        qset = list(dict.fromkeys(tokenize(expand_query(query))))
+        bm = self._bm25_ranked(qset)
+        if qvec is None or not self.has_embeddings:
+            return [self._hit(i, s, qset) for i, s in bm[:k]]
+        sem = self._semantic_ranked(qvec)
+        bm_score = dict(bm)
+        sem_score = dict(sem)
+        order: list[int] = []
+        seen: set[int] = set()
+        bi = si = 0
+        while len(order) < k and (bi < len(bm) or si < len(sem)):
+            if bi < len(bm):
+                i = bm[bi][0]; bi += 1
+                if i not in seen:
+                    seen.add(i); order.append(i)
+            if len(order) >= k:
+                break
+            if si < len(sem):
+                i = sem[si][0]; si += 1
+                if i not in seen:
+                    seen.add(i); order.append(i)
+        return [self._hit(i, sem_score.get(i, bm_score.get(i, 0.0)), qset) for i in order]
 
     def read_section(self, doc: str, clause: Optional[str] = None) -> list[dict]:
         dq = doc.lower()

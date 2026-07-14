@@ -373,6 +373,48 @@ def chunk_doc(doc: str, pages: list[str], _allow_curriculum: bool = True) -> lis
     ]
 
 
+MAX_CHUNK_CHARS = 1500  # oversized chunks bury content + blur embeddings
+
+
+def _split_text(text: str, max_chars: int) -> list[str]:
+    """Greedily pack paragraphs (then sentences) into parts <= max_chars."""
+    blocks = re.split(r"\n\s*\n", text)
+    if len(blocks) == 1:
+        blocks = text.split("\n")
+    parts: list[str] = []
+    cur = ""
+    for b in blocks:
+        b = b.strip()
+        if not b:
+            continue
+        if len(b) > max_chars:  # a single huge block -> split on sentences
+            for s in re.split(r"(?<=[.;])\s+", b):
+                if cur and len(cur) + len(s) > max_chars:
+                    parts.append(cur.strip())
+                    cur = ""
+                cur += s + " "
+            continue
+        if cur and len(cur) + len(b) > max_chars:
+            parts.append(cur.strip())
+            cur = ""
+        cur += b + "\n"
+    if cur.strip():
+        parts.append(cur.strip())
+    return parts
+
+
+def split_oversized(chunks: list[dict], max_chars: int = MAX_CHUNK_CHARS) -> list[dict]:
+    """Split any chunk longer than max_chars into smaller same-clause parts."""
+    out: list[dict] = []
+    for c in chunks:
+        if len(c["text"]) <= max_chars:
+            out.append(c)
+            continue
+        for part in _split_text(c["text"], max_chars):
+            out.append({**c, "text": part})
+    return out
+
+
 def make_ids(chunks: list[dict]) -> None:
     """Assign a stable, unique id per chunk (clause ids can repeat in a doc)."""
     seen: dict[tuple, int] = {}
@@ -402,6 +444,7 @@ def main() -> int:
         if not pages:
             continue
         cs = chunk_pdf(pdf, name, pages)
+        cs = split_oversized(cs)
         make_ids(cs)
         all_chunks.extend(cs)
         print(f"  {name}: {len(pages)} pages -> {len(cs)} chunks")
