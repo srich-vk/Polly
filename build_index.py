@@ -97,8 +97,8 @@ def extract_pages(pdf_path: Path) -> list[str]:
     return pages
 
 
-def match_heading(line: str):
-    """If `line` starts a new clause/section, return its id string, else None."""
+def match_heading(line: str, prev_line: str = "") -> "str | None":
+    """Numbered/keyword clause heading (e.g. '3.2 Attendance', 'Section 4')."""
     if len(line) > MAX_HEADING_LEN:
         return None
     for pat in HEADING_PATTERNS:
@@ -108,10 +108,44 @@ def match_heading(line: str):
     return None
 
 
-def chunk_doc(doc: str, pages: list[str]) -> list[dict]:
-    """Split one doc's pages into clause/section chunks."""
+# Small words that don't count toward a line looking "title-cased".
+_STOP = {"a", "an", "the", "of", "to", "for", "and", "or", "in", "on", "at",
+         "by", "with", "as", "is", "are", "be", "per", "from", "into", "under", "over"}
+
+
+def match_text_heading(line: str, prev_line: str = "") -> "str | None":
+    """Unnumbered *titled* section heading, e.g. 'Minimum Credits to be taken in
+    a Semester' or 'Guidelines for MS & PhD students:'.
+
+    Deliberately conservative and only used as a second pass for docs that have
+    no numbered headings at all, so it can't shred well-structured docs.
+    """
+    s = line.strip()
+    if not (3 <= len(s) <= 80):
+        return None
+    words = s.split()
+    if not (2 <= len(words) <= 12):
+        return None
+    if s[-1] in ".,;":                       # sentence-like → not a heading
+        return None
+    if s.endswith(":"):                      # trailing colon is a strong heading signal
+        return s[:-1].strip()[:60]
+    # Otherwise require Title-Case / ALL-CAPS and a clean break from prior text.
+    sig = [w for w in words if w[:1].isalpha() and w.lower() not in _STOP]
+    if not sig:
+        return None
+    title_like = (sum(w[:1].isupper() for w in sig) / len(sig) >= 0.7) or s.isupper()
+    prev = prev_line.strip()
+    clean_break = prev == "" or prev.endswith((".", ":", "?"))
+    if title_like and clean_break:
+        return s[:60]
+    return None
+
+
+def _accumulate(doc: str, pages: list[str], detector) -> list[dict]:
+    """Walk lines, starting a new chunk whenever `detector(line, prev)` fires."""
     chunks: list[dict] = []
-    cur = None  # active chunk being accumulated
+    cur = None
 
     def flush():
         nonlocal cur
@@ -121,30 +155,40 @@ def chunk_doc(doc: str, pages: list[str]) -> list[dict]:
         cur = None
 
     for pno, page in enumerate(pages, start=1):
+        prev = ""
         for line in page.splitlines():
-            clause = match_heading(line)
-            if clause is not None:
+            clause = detector(line, prev)
+            if clause:
                 flush()
                 cur = {"doc": doc, "clause": clause, "page": pno, "text": line + "\n"}
             else:
                 if cur is None:
-                    # Preamble before the first detected heading.
                     cur = {"doc": doc, "clause": "preamble", "page": pno, "text": ""}
                 cur["text"] += line + "\n"
+            prev = line
     flush()
-
-    # Fallback: doc had no real structure (only preamble) → page-level chunks so
-    # results stay citable instead of one giant blob.
-    non_preamble = [c for c in chunks if c["clause"] != "preamble"]
-    if not non_preamble:
-        chunks = []
-        for pno, page in enumerate(pages, start=1):
-            if page.strip():
-                chunks.append(
-                    {"doc": doc, "clause": f"page-{pno}", "page": pno,
-                     "text": page.strip()}
-                )
     return chunks
+
+
+def chunk_doc(doc: str, pages: list[str]) -> list[dict]:
+    """Split one doc into chunks, trying progressively looser structure.
+
+    1. Numbered/keyword clauses (clean, unambiguous).
+    2. If none found, unnumbered titled headings (for prose-style docs).
+    3. If still none, page-level chunks so results stay citable.
+    """
+    chunks = _accumulate(doc, pages, match_heading)
+    if any(c["clause"] != "preamble" for c in chunks):
+        return chunks
+
+    titled = _accumulate(doc, pages, match_text_heading)
+    if any(c["clause"] != "preamble" for c in titled):
+        return titled
+
+    return [
+        {"doc": doc, "clause": f"page-{pno}", "page": pno, "text": page.strip()}
+        for pno, page in enumerate(pages, start=1) if page.strip()
+    ]
 
 
 def make_ids(chunks: list[dict]) -> None:
