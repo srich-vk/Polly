@@ -58,7 +58,25 @@ anything numeric or conditional.
 - If the documents do not contain the answer, say so explicitly, e.g. "This is not \
 covered in the available policy documents." Do NOT guess. A confidently wrong policy \
 answer is worse than admitting the information is not found.
+- NEVER announce or describe a search in prose (do not write "I will now search..." or \
+"let me look for..."). Just call the tool directly. Write prose ONLY for your final \
+answer, once you already have the information or have confirmed it is absent.
 """
+
+# Phrases that mean the model narrated a next step instead of calling the tool.
+_CONTINUATION_HINTS = (
+    "i will now", "i'll now", "will now conduct", "conduct another", "another search",
+    "search again", "let me search", "let's search", "let me look", "let's try",
+    "let us try", "let me refine", "let's refine", "i will search", "i'll search",
+    "i will conduct", "i'll conduct", "i will look", "i'll look", "i am going to",
+    "try searching", "refine our search", "refine the search", "next, i",
+)
+MAX_NUDGES = 3
+
+
+def _looks_incomplete(content: str) -> bool:
+    low = content.lower()
+    return any(h in low for h in _CONTINUATION_HINTS)
 
 TOOLS = [
     {
@@ -170,23 +188,48 @@ def ask(question: str, show_work: bool = False) -> str:
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": question},
     ]
+    nudges = 0
     for _ in range(MAX_ITERS):
         msg = _chat(messages)
         messages.append(msg)
         calls = msg.get("tool_calls") or []
-        if not calls:
-            return _verify_citations(msg.get("content", "").strip())
-        for tc in calls:
-            fn = tc.get("function", {})
-            name = fn.get("name", "")
-            raw_args = fn.get("arguments", {})
-            args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-            handler = DISPATCH.get(name)
-            result = handler(args) if handler else f"Unknown tool: {name}"
+        if calls:
+            for tc in calls:
+                fn = tc.get("function", {})
+                name = fn.get("name", "")
+                raw_args = fn.get("arguments", {})
+                args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                handler = DISPATCH.get(name)
+                result = handler(args) if handler else f"Unknown tool: {name}"
+                if show_work:
+                    print("  " + _c("2", f"↳ {name}({json.dumps(args)})", sys.stderr), file=sys.stderr)
+                messages.append({"role": "tool", "content": result})
+            continue
+
+        content = (msg.get("content") or "").strip()
+        # The model wrote prose but made no tool call. If it merely announced a
+        # search instead of performing it, nudge it to actually call the tool
+        # rather than accepting the narration as a (non-)answer.
+        if _looks_incomplete(content) and nudges < MAX_NUDGES:
+            nudges += 1
             if show_work:
-                print("  " + _c("2", f"↳ {name}({json.dumps(args)})", sys.stderr), file=sys.stderr)
-            messages.append({"role": "tool", "content": result})
-    return "(Stopped after too many search steps without a final answer. Try rephrasing.)"
+                print("  " + _c("2", "↳ (nudge: narrated a search but didn't call it)", sys.stderr),
+                      file=sys.stderr)
+            messages.append({
+                "role": "user",
+                "content": (
+                    "Do not describe your next step in prose. Call search_docs or "
+                    "read_section now if you need more information. If you already have "
+                    "enough, give the final answer with citations. If the documents do "
+                    "not contain the answer, say so explicitly."
+                ),
+            })
+            continue
+        return _verify_citations(content)
+    return _verify_citations(
+        "I could not find this in the available documents after several searches. "
+        "Try rephrasing with the exact terms used in the policy."
+    )
 
 
 # --------------------------------------------------------------------------- #
