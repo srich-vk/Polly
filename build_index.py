@@ -35,6 +35,15 @@ HAS_OCR = bool(shutil.which("pdftoppm") and shutil.which("tesseract"))
 # A page with fewer real chars than this is treated as empty -> OCR candidate.
 OCR_MIN_CHARS = 20
 
+try:
+    import pdfplumber  # optional: structured parsing of curriculum tables
+    HAS_PDFPLUMBER = True
+except ImportError:
+    HAS_PDFPLUMBER = False
+
+_ROMAN_TO_INT = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5}
+_INT_TO_ROMAN = {1: "I", 2: "II", 3: "III", 4: "IV", 5: "V"}
+
 # A heading is a line that begins a new numbered clause/section. Kept
 # deliberately conservative to avoid shredding running text into noise.
 HEADING_PATTERNS = [
@@ -223,6 +232,122 @@ def chunk_curriculum(doc: str, pages: list[str]) -> list[dict]:
     return chunks
 
 
+def _advance_sem(year: int, sem: int) -> tuple[int, int]:
+    return (year, 2) if sem == 1 else (year + 1, 1)
+
+
+def _credits_of(cell: str) -> int:
+    """Sum the numbers in a credit-distribution cell, e.g. '- 4 - - - -' -> 4."""
+    return sum(int(x) for x in re.findall(r"\d+", cell or ""))
+
+
+def parse_curriculum_tables(pdf_path: Path, doc: str) -> list[dict]:
+    """Parse a semester-wise curriculum PDF into one structured chunk per
+    semester using pdfplumber, so course credits are unambiguous to the reader.
+
+    Returns [] if pdfplumber is unavailable or finds no usable tables (caller
+    then falls back to the text-based chunker).
+    """
+    if not HAS_PDFPLUMBER:
+        return []
+    chunks: list[dict] = []
+    year = sem = 0
+    try:
+        pdf = pdfplumber.open(pdf_path)
+    except Exception:  # noqa: BLE001
+        return []
+    with pdf:
+        for pno, page in enumerate(pdf.pages, start=1):
+            for table in page.extract_tables() or []:
+                rows = table
+                i = 0
+                while i < len(rows):
+                    row = [(c or "").strip() for c in rows[i]]
+                    joined = " ".join(row)
+                    term = next((c for c in row if c.lower() in ("monsoon", "spring")), None)
+                    if not term:
+                        i += 1
+                        continue
+                    tok = _SEM_TOKEN.search(joined)
+                    if tok:
+                        year = _ROMAN_TO_INT[tok.group(1)]
+                        sem = _ROMAN_TO_INT[tok.group(2)]
+                    elif (year, sem) == (0, 0):
+                        year, sem = 1, 1
+                    else:
+                        year, sem = _advance_sem(year, sem)
+                    label = f"{_INT_TO_ROMAN[year]}-{_INT_TO_ROMAN[sem]}"
+                    course_row = rows[i + 1] if i + 1 < len(rows) else None
+                    text = _format_semester(course_row, term, label)
+                    if text:
+                        chunks.append({"doc": doc, "clause": label, "page": pno, "text": text})
+                    i += 2
+    return chunks
+
+
+def _is_course_name(s: str) -> bool:
+    s = s.strip()
+    if not s or s.lower() in ("sub total", "total", "monsoon", "spring"):
+        return False
+    if re.match(r"^[A-Z]{1,3}\d", s):        # a course code
+        return False
+    if s in ("Full", "Half") or re.match(r"^[\d\s\-]+$", s):  # type / numbers
+        return False
+    return any(ch.isalpha() for ch in s)
+
+
+def _format_semester(course_row, term: str, label: str) -> str:
+    """Render one semester's courses as an explicit, column-labelled table.
+
+    Anchors on the course-NAME column (the only reliably complete one — many
+    electives have no code), and aligns type / L-T-P / credit columns by row
+    index. Codes are shown only when their count matches the course count, since
+    blank-code rows otherwise misalign that column.
+    """
+    if not course_row:
+        return ""
+    col = [(c or "").split("\n") for c in course_row]
+
+    def find(pred):
+        return next((c for c in col if c and pred(c[0].strip())), [])
+
+    # Names = the column with the most course-name-like entries.
+    names_col = max(col, key=lambda c: sum(_is_course_name(x) for x in c), default=[])
+    names = [x.strip() for x in names_col if _is_course_name(x)]
+    if not names:
+        return ""
+    types = find(lambda s: s in ("Full", "Half"))
+    ltp = find(lambda s: re.match(r"^\d\s+\d\s+\d", s))
+    credits = next((c for c in col
+                    if c and re.match(r"^[-\d](\s|$)", c[0].strip()) and c is not ltp), [])
+    codes = find(lambda s: re.match(r"^[A-Z]{1,3}\d", s))
+    code_vals = [x.strip() for x in codes if x.strip()]
+    use_codes = len(code_vals) == len(names)
+
+    def g(lst, i):
+        return lst[i].strip() if i < len(lst) else ""
+
+    lines = [f"{term} — Semester {label}", "Course | Full/Half | L-T-P | Credits"]
+    total = 0
+    for i, name in enumerate(names):
+        cr = _credits_of(g(credits, i))
+        total += cr
+        code = f"{code_vals[i]} " if use_codes else ""
+        lines.append(f"{code}{name} | {g(types, i)} | {g(ltp, i)} | {cr} credits")
+    lines.append(f"Total credits: {total}")
+    return "\n".join(lines)
+
+
+def chunk_pdf(pdf_path: Path, doc: str, pages: list[str]) -> list[dict]:
+    """Top-level dispatch: structured curriculum parsing, else text chunking."""
+    if is_curriculum(pages):
+        structured = parse_curriculum_tables(pdf_path, doc)
+        if structured:
+            return structured
+        return chunk_curriculum(doc, pages)  # text fallback
+    return chunk_doc(doc, pages, _allow_curriculum=False)
+
+
 def chunk_doc(doc: str, pages: list[str], _allow_curriculum: bool = True) -> list[dict]:
     """Split one doc into chunks, trying progressively looser structure.
 
@@ -276,7 +401,7 @@ def main() -> int:
         pages = extract_pages(pdf)
         if not pages:
             continue
-        cs = chunk_doc(name, pages)
+        cs = chunk_pdf(pdf, name, pages)
         make_ids(cs)
         all_chunks.extend(cs)
         print(f"  {name}: {len(pages)} pages -> {len(cs)} chunks")

@@ -130,9 +130,15 @@ def _tool_search_docs(args: dict) -> str:
             f'No sections matched "{args.get("keyword", "")}". Try different terms, '
             f"an exact clause number, or a document name."
         )
-    return "\n\n".join(
+    body = "\n\n".join(
         f'[{h["doc"]} · clause {h["clause"]} · p{h["page"]}] (score {h["score"]})\n{h["snippet"]}'
         for h in hits
+    )
+    return (
+        body
+        + "\n\nThese are truncated snippets. Before answering, call read_section with a "
+        "result's document and clause to get its full text (e.g. complete course lists, "
+        "totals, exact wording)."
     )
 
 

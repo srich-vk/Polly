@@ -30,8 +30,9 @@ codes):
   ```bash
   ollama pull qwen2.5:3b        # ~1.9 GB, sized for a 4 GB GPU
   ```
-- To *rebuild* the index only: `poppler` (`pdftotext`, `pdftoppm`) and
-  `tesseract` OCR. Not needed to just query — `index.json` is committed.
+- To *rebuild* the index only: `poppler` (`pdftotext`, `pdftoppm`), `tesseract`
+  OCR, and `pdfplumber` (`pip install --user pdfplumber`, for structured parsing
+  of curriculum tables). None needed to just query — `index.json` is committed.
 
 ## Usage
 
@@ -78,10 +79,12 @@ python3 build_index.py --docs "College Guidelines" --out index.json
 
 ## Curriculum / course-list queries
 
-Semester-wise curriculum PDFs (e.g. `BTech-ECD-V2`) are extracted with layout
-preserved and chunked **one chunk per semester**, labelled with the doc's
-year-sem notation (`III-I`). You can query in plain arabic notation — a
-normalizer maps `3-1` → `III-I` automatically:
+Semester-wise curriculum PDFs (e.g. `BTech-ECD-V2`) are parsed with `pdfplumber`
+into **one chunk per semester**, each an explicit
+`Course | Full/Half | L-T-P | Credits` table with a per-semester credit total —
+so credits are unambiguous rather than a mangled text grid. Chunks are labelled
+with the doc's year-sem notation (`III-I`). You can query in plain arabic
+notation — a normalizer maps `3-1` → `III-I` automatically:
 
 ```bash
 policy-ask "what courses do I take in ECD sem 3-1?"
@@ -90,9 +93,9 @@ policy-ask --search "CSE 2-2"        # -> BTech-CSE-V2, clause II-II
 
 ## Notes & limitations
 
-- Curriculum tables are dense; the local 3B model reliably lists the **courses**
-  for a semester but can misread the L/T/P/credit **columns**. The citation
-  (e.g. `III-I`) lets you verify against the source.
+- Curriculum credits are parsed structurally, so the model reports them
+  correctly. It still helps to phrase course-list questions so the model reads
+  the full section (the search hint prompts it to).
 - The LLM adds convenience (natural-language questions, interpreting
   conditional/numeric policy) at a small residual hallucination risk that the
   `--search` path avoids entirely. Use `--search` for pure exact-term lookups.
