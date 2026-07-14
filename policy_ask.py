@@ -70,13 +70,37 @@ _CONTINUATION_HINTS = (
     "let us try", "let me refine", "let's refine", "i will search", "i'll search",
     "i will conduct", "i'll conduct", "i will look", "i'll look", "i am going to",
     "try searching", "refine our search", "refine the search", "next, i",
+    "please wait", "i need to read", "i need to call", "i will call", "i'll call",
+    "need to read the", "i need to check", "i should read", "let me read",
 )
 MAX_NUDGES = 3
 
 
 def _looks_incomplete(content: str) -> bool:
     low = content.lower()
-    return any(h in low for h in _CONTINUATION_HINTS)
+    if any(h in low for h in _CONTINUATION_HINTS):
+        return True
+    # Names a tool but didn't actually call it (a promise, not an answer).
+    if ("read_section" in low or "search_docs" in low) and any(
+        w in low for w in ("call", "function", "need to", "wait", "will")
+    ):
+        return True
+    return False
+
+
+# Small models sometimes emit a tool call as text, e.g. read_section {"doc": ...}
+# instead of via the structured tool-call field. Recover those and run them.
+_TEXT_CALL_RE = re.compile(r"(search_docs|read_section)\s*[\(:]?\s*(\{[^{}]*\})")
+
+
+def _extract_text_calls(content: str) -> list[tuple[str, dict]]:
+    calls = []
+    for m in _TEXT_CALL_RE.finditer(content or ""):
+        try:
+            calls.append((m.group(1), json.loads(m.group(2))))
+        except json.JSONDecodeError:
+            continue
+    return calls
 
 TOOLS = [
     {
@@ -195,24 +219,45 @@ def ask(question: str, show_work: bool = False) -> str:
         {"role": "user", "content": question},
     ]
     nudges = 0
+    tool_used = False
     for _ in range(MAX_ITERS):
         msg = _chat(messages)
         messages.append(msg)
-        calls = msg.get("tool_calls") or []
-        if calls:
-            for tc in calls:
-                fn = tc.get("function", {})
-                name = fn.get("name", "")
-                raw_args = fn.get("arguments", {})
-                args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+        content = (msg.get("content") or "").strip()
+        # Structured tool calls, plus any the model wrote as plain text.
+        norm: list[tuple[str, dict]] = []
+        for tc in msg.get("tool_calls") or []:
+            fn = tc.get("function", {})
+            raw = fn.get("arguments", {})
+            norm.append((fn.get("name", ""), json.loads(raw) if isinstance(raw, str) else raw))
+        if not norm:
+            norm = _extract_text_calls(content)
+        if norm:
+            tool_used = True
+            for name, args in norm:
                 handler = DISPATCH.get(name)
                 result = handler(args) if handler else f"Unknown tool: {name}"
                 if show_work:
                     print("  " + _c("2", f"↳ {name}({json.dumps(args)})", sys.stderr), file=sys.stderr)
                 messages.append({"role": "tool", "content": result})
             continue
+        # Never let the model conclude (especially "not found") without searching:
+        # small models sometimes answer from their own empty knowledge. Force at
+        # least one search first.
+        if not tool_used and nudges < MAX_NUDGES:
+            nudges += 1
+            if show_work:
+                print("  " + _c("2", "↳ (nudge: concluded without searching)", sys.stderr),
+                      file=sys.stderr)
+            messages.append({
+                "role": "user",
+                "content": (
+                    "You have not searched the documents yet. Call search_docs now with "
+                    "the key terms from the question before drawing any conclusion."
+                ),
+            })
+            continue
 
-        content = (msg.get("content") or "").strip()
         # The model wrote prose but made no tool call. If it merely announced a
         # search instead of performing it, nudge it to actually call the tool
         # rather than accepting the narration as a (non-)answer.
@@ -257,6 +302,7 @@ def _verify_citations(answer: str) -> str:
         "none of the", "cannot find", "could not find", "not mention", "not specif",
         "not addressed", "unable to find", "no relevant", "not in the available",
         "not present", "do not contain", "does not contain", "isn't covered", "no mention",
+        "no sections", "no matching", "there are no", "matching the term", "not able to find",
     )
     low = answer.lower()
     looks_not_found = any(m in low for m in _NOT_FOUND)
