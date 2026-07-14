@@ -76,13 +76,27 @@ python3 build_index.py --docs "College Guidelines" --out index.json
 | `retrieval.py` | Stdlib BM25 retrieval engine |
 | `policy_ask.py` | Agent loop + tool dispatch + citation verifier + CLI |
 
+## Curriculum / course-list queries
+
+Semester-wise curriculum PDFs (e.g. `BTech-ECD-V2`) are extracted with layout
+preserved and chunked **one chunk per semester**, labelled with the doc's
+year-sem notation (`III-I`). You can query in plain arabic notation — a
+normalizer maps `3-1` → `III-I` automatically:
+
+```bash
+policy-ask "what courses do I take in ECD sem 3-1?"
+policy-ask --search "CSE 2-2"        # -> BTech-CSE-V2, clause II-II
+```
+
 ## Notes & limitations
 
-- Some docs (scanned/unstructured) are chunked by page (`page-N`) rather than
-  clause number; for those, the model may cite a page instead of a clause, and
-  the citation verifier will flag any invented clause numbers.
+- Curriculum tables are dense; the local 3B model reliably lists the **courses**
+  for a semester but can misread the L/T/P/credit **columns**. The citation
+  (e.g. `III-I`) lets you verify against the source.
 - The LLM adds convenience (natural-language questions, interpreting
   conditional/numeric policy) at a small residual hallucination risk that the
   `--search` path avoids entirely. Use `--search` for pure exact-term lookups.
+- If the model narrates a search instead of running it, the loop nudges it to
+  actually call the tool rather than returning the narration.
 
 [ollama]: https://ollama.com

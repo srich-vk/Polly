@@ -27,6 +27,20 @@ def tokenize(s: str) -> list[str]:
     return _TOKEN_RE.findall(s.lower())
 
 
+_ROMAN = {"1": "i", "2": "ii", "3": "iii", "4": "iv", "5": "v"}
+_ARABIC_SEM = re.compile(r"\b([1-5])-([1-2])\b")
+
+
+def expand_query(q: str) -> str:
+    """Bridge user notation to curriculum-table notation: '3-1' -> 'iii-i'.
+
+    Curriculum docs label semesters in Roman year-sem form (III-I); users type
+    arabic (3-1). Append the Roman form so BM25 can match either.
+    """
+    extra = [f"{_ROMAN[m.group(1)]}-{_ROMAN[m.group(2)]}" for m in _ARABIC_SEM.finditer(q)]
+    return q + (" " + " ".join(extra) if extra else "")
+
+
 class Retriever:
     def __init__(self, index_path: Path = INDEX_PATH):
         data = json.loads(Path(index_path).read_text(encoding="utf-8"))
@@ -34,9 +48,13 @@ class Retriever:
         self.source_dir: str = data.get("source_dir", "")
         self.doc_count: int = data.get("doc_count", 0)
 
-        # Precompute per-chunk token stats + document frequencies.
+        # Precompute per-chunk token stats + document frequencies. The doc name's
+        # separators are split so a query like "ECD" matches the *name*
+        # "BTech-ECD-V2" (whose compound token wouldn't otherwise match), while
+        # body text keeps exact compound terms (3.2, b.tech) intact.
         self._doc_tokens: list[list[str]] = [
-            tokenize(f"{c['doc']} {c['text']}") for c in self.chunks
+            tokenize(f"{c['doc'].replace('-', ' ').replace('_', ' ')} {c['text']}")
+            for c in self.chunks
         ]
         self._N = len(self.chunks)
         self._df: dict[str, int] = {}
@@ -53,7 +71,7 @@ class Retriever:
         return max(0.0, math.log(1 + (self._N - n + 0.5) / (n + 0.5)))
 
     def search(self, query: str, k: int = 6) -> list[dict]:
-        qset = list(dict.fromkeys(tokenize(query)))
+        qset = list(dict.fromkeys(tokenize(expand_query(query))))
         if not qset:
             return []
         scored: list[tuple[float, int]] = []

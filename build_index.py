@@ -78,8 +78,10 @@ def extract_pages(pdf_path: Path) -> list[str]:
     is only partially scanned still keeps its native text where it exists.
     """
     try:
+        # -layout preserves table columns/rows (curriculum docs are tables) while
+        # still reading prose sensibly.
         paged = subprocess.run(
-            ["pdftotext", "-q", str(pdf_path), "-"],
+            ["pdftotext", "-layout", "-q", str(pdf_path), "-"],
             capture_output=True, text=True, timeout=120,
         ).stdout
     except Exception as e:  # noqa: BLE001
@@ -170,13 +172,68 @@ def _accumulate(doc: str, pages: list[str], detector) -> list[dict]:
     return chunks
 
 
-def chunk_doc(doc: str, pages: list[str]) -> list[dict]:
+# Year-Semester token used in curriculum tables, e.g. "III-I" (year 3, sem 1).
+_SEM_TOKEN = re.compile(r"\b(V|IV|III|II|I)-(II|I)\b")
+_TERM_BANNER = re.compile(r"^\s*(monsoon|spring)\s*$", re.IGNORECASE)
+
+
+def is_curriculum(pages: list[str]) -> bool:
+    """A semester-wise course table: has several distinct year-sem tokens."""
+    text = "\n".join(pages)
+    tokens = {m.group(0) for m in _SEM_TOKEN.finditer(text)}
+    return len(tokens) >= 3
+
+
+def chunk_curriculum(doc: str, pages: list[str]) -> list[dict]:
+    """Chunk a curriculum table into one chunk per semester block.
+
+    Blocks are delimited by Monsoon/Spring term banners; each block is labelled
+    with the year-semester token found inside it (e.g. clause 'III-I'), so a
+    semester's course list is a single citable chunk.
+    """
+    chunks: list[dict] = []
+    cur = None
+    n = 0
+
+    def flush():
+        nonlocal cur
+        if cur and cur["text"].strip():
+            cur["text"] = cur["text"].strip()
+            m = _SEM_TOKEN.search(cur["text"])
+            cur["clause"] = m.group(0) if m else cur["clause"]
+            chunks.append(cur)
+        cur = None
+
+    for pno, page in enumerate(pages, start=1):
+        for line in page.splitlines():
+            if _TERM_BANNER.match(line):
+                flush()
+                n += 1
+                cur = {"doc": doc, "clause": f"sem-{n}", "page": pno,
+                       "text": line.strip() + "\n"}
+            else:
+                if cur is None:
+                    cur = {"doc": doc, "clause": "overview", "page": pno, "text": ""}
+                cur["text"] += line + "\n"
+    flush()
+
+    non_overview = [c for c in chunks if c["clause"] != "overview"]
+    if not non_overview:  # no term banners → fall back to generic pipeline
+        return chunk_doc(doc, pages, _allow_curriculum=False)
+    return chunks
+
+
+def chunk_doc(doc: str, pages: list[str], _allow_curriculum: bool = True) -> list[dict]:
     """Split one doc into chunks, trying progressively looser structure.
 
+    0. Curriculum tables → one chunk per semester block.
     1. Numbered/keyword clauses (clean, unambiguous).
     2. If none found, unnumbered titled headings (for prose-style docs).
     3. If still none, page-level chunks so results stay citable.
     """
+    if _allow_curriculum and is_curriculum(pages):
+        return chunk_curriculum(doc, pages)
+
     chunks = _accumulate(doc, pages, match_heading)
     if any(c["clause"] != "preamble" for c in chunks):
         return chunks
