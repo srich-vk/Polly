@@ -89,18 +89,38 @@ def _looks_incomplete(content: str) -> bool:
     return False
 
 
-# Small models sometimes emit a tool call as text, e.g. read_section {"doc": ...}
-# instead of via the structured tool-call field. Recover those and run them.
-_TEXT_CALL_RE = re.compile(r"(search_docs|read_section)\s*[\(:]?\s*(\{[^{}]*\})")
+# Small models sometimes emit a tool call as text instead of via the structured
+# tool-call field, in either JSON form  -> read_section {"doc": "X"}
+# or key=value form                     -> read_section doc="X" clause="Y"
+# Recover both and run them.
+_JSON_CALL_RE = re.compile(r"(search_docs|read_section)\s*[\(:]?\s*(\{[^{}]*\})")
+_KV_CALL_RE = re.compile(
+    r"(search_docs|read_section)\s*\(?\s*"
+    r"((?:\w+\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s,)]+)[\s,]*)+)"
+)
+_KV_PAIR_RE = re.compile(r"(\w+)\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s,)]+)")
 
 
 def _extract_text_calls(content: str) -> list[tuple[str, dict]]:
-    calls = []
-    for m in _TEXT_CALL_RE.finditer(content or ""):
+    content = content or ""
+    calls: list[tuple[str, dict]] = []
+    seen: set[str] = set()
+
+    def add(name: str, args: dict):
+        key = name + repr(sorted(args.items()))
+        if key not in seen and args:
+            seen.add(key)
+            calls.append((name, args))
+
+    for m in _JSON_CALL_RE.finditer(content):
         try:
-            calls.append((m.group(1), json.loads(m.group(2))))
+            add(m.group(1), json.loads(m.group(2)))
         except json.JSONDecodeError:
             continue
+    for m in _KV_CALL_RE.finditer(content):
+        args = {km.group(1): km.group(2).strip("\"'")
+                for km in _KV_PAIR_RE.finditer(m.group(2))}
+        add(m.group(1), args)
     return calls
 
 TOOLS = [
